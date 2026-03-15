@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
   Upload, 
   Link as LinkIcon, 
@@ -23,10 +23,31 @@ import {
   Monitor,
   Smartphone,
   Layout,
-  ArrowRight
+  ArrowRight,
+  History,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { analyzeSellingPoints, generateAmazonImage, generateAPlusContent } from '../services/gemini';
+import { generateCacheKey, cacheSet, cacheGet, lsSave, lsLoad } from '../services/cache';
+
+// ── 缓存会话类型 ──────────────────────────────────────────
+interface ImageCacheSession {
+  inputs: {
+    sku: string;
+    keywords: string;
+    userSellingPoints: string;
+    competitorLink: string;
+    aspectRatio: '1:1' | '4:5';
+  };
+  aiSellingPoints: SellingPoint[];
+  selectedPoints: number[];
+  images: GeneratedImage[];
+  timestamp: number;
+}
+
+const LAST_IMAGE_KEY = 'image_last_key';
+const MAX_HISTORY = 2; // 每张图最多保留几个历史版本
 import confetti from 'canvas-confetti';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
@@ -56,6 +77,7 @@ interface GeneratedImage {
   type: string;
   prompt: string;
   status: 'idle' | 'generating' | 'done' | 'error';
+  history: string[]; // 历史版本 URL（最多 MAX_HISTORY 条）
 }
 
 export default function ImageProApp() {
@@ -105,17 +127,65 @@ export default function ImageProApp() {
   const [aplusModules, setAplusModules] = useState<APlusModule[]>([]);
   const [isGeneratingAPlus, setIsGeneratingAPlus] = useState(false);
   const [images, setImages] = useState<GeneratedImage[]>([
-    { id: 1, url: '', type: '场景图 1 (室内使用)', prompt: 'Lifestyle image of the product being used in a modern home setting, cinematic lighting, realistic, preserving original product texture and materials.', status: 'idle' },
-    { id: 2, url: '', type: '场景图 2 (户外/特定环境)', prompt: 'Lifestyle image of the product in its natural environment, high quality, professional photography, maintain original product material details.', status: 'idle' },
-    { id: 3, url: '', type: '场景图 3 (多角度展示)', prompt: 'Professional product photography from a dynamic angle in a stylish environment, premium feel, high fidelity to original product texture.', status: 'idle' },
-    { id: 4, url: '', type: '场景图 4 (细节氛围)', prompt: 'Atmospheric shot of the product highlighting its design and aesthetic in a real-world context, photorealistic materials.', status: 'idle' },
-    { id: 5, url: '', type: '细节图 (特写)', prompt: 'Close-up macro shot of the product showing high-quality materials and texture, professional studio lighting, exact material reproduction.', status: 'idle' },
-    { id: 6, url: '', type: '功能图 (信息图)', prompt: 'Infographic style image showing product features, clean layout, modern design, realistic product representation.', status: 'idle' },
-    { id: 7, url: '', type: '尺寸图', prompt: 'Product image with dimension lines and text showing size, professional and clear, maintaining product visual integrity.', status: 'idle' },
+    { id: 1, url: '', type: '场景图 1 (室内使用)', prompt: 'Lifestyle image of the product being used in a modern home setting, cinematic lighting, realistic, preserving original product texture and materials.', status: 'idle', history: [] },
+    { id: 2, url: '', type: '场景图 2 (户外/特定环境)', prompt: 'Lifestyle image of the product in its natural environment, high quality, professional photography, maintain original product material details.', status: 'idle', history: [] },
+    { id: 3, url: '', type: '场景图 3 (多角度展示)', prompt: 'Professional product photography from a dynamic angle in a stylish environment, premium feel, high fidelity to original product texture.', status: 'idle', history: [] },
+    { id: 4, url: '', type: '场景图 4 (细节氛围)', prompt: 'Atmospheric shot of the product highlighting its design and aesthetic in a real-world context, photorealistic materials.', status: 'idle', history: [] },
+    { id: 5, url: '', type: '细节图 (特写)', prompt: 'Close-up macro shot of the product showing high-quality materials and texture, professional studio lighting, exact material reproduction.', status: 'idle', history: [] },
+    { id: 6, url: '', type: '功能图 (信息图)', prompt: 'Infographic style image showing product features, clean layout, modern design, realistic product representation.', status: 'idle', history: [] },
+    { id: 7, url: '', type: '尺寸图', prompt: 'Product image with dimension lines and text showing size, professional and clear, maintaining product visual integrity.', status: 'idle', history: [] },
   ]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const regenFileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── 缓存相关 ──────────────────────────────────────────────
+  const [cachedSession, setCachedSession] = useState<ImageCacheSession | null>(null);
+  // 用 ref 存当前 session key，避免异步闭包内读到过期值
+  const sessionKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const lastKey = lsLoad<string>(LAST_IMAGE_KEY);
+    if (!lastKey) return;
+    cacheGet<ImageCacheSession>(lastKey).then(session => {
+      if (session && session.images.some(img => img.url)) {
+        setCachedSession(session);
+      }
+    });
+  }, []);
+
+  /** 将当前 images 状态保存到缓存 */
+  const persistImages = useCallback(async (
+    imgs: GeneratedImage[],
+    overrideAiSP?: SellingPoint[],
+    overrideSP?: number[],
+  ) => {
+    if (!sessionKeyRef.current) return;
+    const session: ImageCacheSession = {
+      inputs: { sku, keywords, userSellingPoints, competitorLink, aspectRatio },
+      aiSellingPoints: overrideAiSP ?? aiSellingPoints,
+      selectedPoints: overrideSP ?? selectedPoints,
+      images: imgs,
+      timestamp: Date.now(),
+    };
+    await cacheSet(sessionKeyRef.current, session);
+  }, [sku, keywords, userSellingPoints, competitorLink, aspectRatio, aiSellingPoints, selectedPoints]);
+
+  /** 恢复上次会话 */
+  const handleRestoreSession = () => {
+    if (!cachedSession) return;
+    const { inputs, aiSellingPoints: sp, selectedPoints: sel, images: imgs } = cachedSession;
+    setSku(inputs.sku);
+    setKeywords(inputs.keywords);
+    setUserSellingPoints(inputs.userSellingPoints);
+    setCompetitorLink(inputs.competitorLink);
+    setAspectRatio(inputs.aspectRatio);
+    setAiSellingPoints(sp);
+    setSelectedPoints(sel);
+    setImages(imgs);
+    setStep('generate');
+    setCachedSession(null);
+  };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -137,11 +207,17 @@ export default function ImageProApp() {
     }
     setLoading(true);
     try {
+      // 计算并存储 session key（在异步生成前完成，供后续 persistImages 使用）
+      const key = await generateCacheKey({ sku, keywords, userSellingPoints, competitorLink, aspectRatio });
+      sessionKeyRef.current = key;
+      lsSave(LAST_IMAGE_KEY, key);
+
       const points = await analyzeSellingPoints(keywords, userSellingPoints, competitorLink, sku);
+      const defaultSelected = [0, 1, 2, 3, 4];
       setAiSellingPoints(points);
-      setSelectedPoints([0, 1, 2, 3, 4]);
+      setSelectedPoints(defaultSelected);
       setStep('generate');
-      generateAllImages();
+      generateAllImages(points, defaultSelected);
     } catch (error: any) {
       console.error(error);
       alert('处理失败，请重试');
@@ -159,15 +235,26 @@ export default function ImageProApp() {
   };
 
   const startGeneration = async () => {
+    if (!sessionKeyRef.current) {
+      // 从卖点确认步骤跳转时，重新计算 key
+      const key = await generateCacheKey({ sku, keywords, userSellingPoints, competitorLink, aspectRatio });
+      sessionKeyRef.current = key;
+      lsSave(LAST_IMAGE_KEY, key);
+    }
     setStep('generate');
     generateAllImages();
   };
 
-  const generateAllImages = async () => {
+  const generateAllImages = async (
+    newAiSP?: SellingPoint[],
+    newSelectedPoints?: number[],
+  ) => {
     if (baseImages.length === 0) {
       alert('请至少上传一张产品图');
       return;
     }
+    const effectiveSP = newAiSP ?? aiSellingPoints;
+    const effectiveSel = newSelectedPoints ?? selectedPoints;
     const updatedImages = [...images];
     
     for (let i = 0; i < updatedImages.length; i++) {
@@ -175,7 +262,7 @@ export default function ImageProApp() {
       setImages([...updatedImages]);
 
       try {
-        const selectedText = selectedPoints.map(idx => aiSellingPoints[idx]?.title ?? '').join(', ');
+        const selectedText = effectiveSel.map(idx => effectiveSP[idx]?.title ?? '').join(', ');
         const finalPrompt = `${updatedImages[i].prompt}. Product features: ${selectedText}. Keywords: ${keywords}`;
         
         const url = await generateAmazonImage(finalPrompt, aspectRatio, baseImages);
@@ -194,6 +281,11 @@ export default function ImageProApp() {
         }
       }
       setImages([...updatedImages]);
+
+      // 每张图生成完毕后立即持久化，防止中途崩溃丢失
+      if (updatedImages[i].url) {
+        persistImages([...updatedImages], effectiveSP, effectiveSel).catch(console.warn);
+      }
     }
     
     if (updatedImages.every(img => img.status === 'done')) {
@@ -210,6 +302,13 @@ export default function ImageProApp() {
     if (index === -1) return;
 
     const updatedImages = [...images];
+
+    // 将当前版本存入历史（重新生成前备份，防止新图生成失败或卡死导致丢失）
+    if (updatedImages[index].url) {
+      const newHistory = [updatedImages[index].url, ...updatedImages[index].history].slice(0, MAX_HISTORY);
+      updatedImages[index].history = newHistory;
+    }
+
     updatedImages[index].status = 'generating';
     setImages([...updatedImages]);
 
@@ -225,6 +324,7 @@ export default function ImageProApp() {
         updatedImages[index].url = url;
         updatedImages[index].status = 'done';
       } else {
+        // 生成失败 → 状态置 error，历史版本依然保留
         updatedImages[index].status = 'error';
       }
     } catch (error: any) {
@@ -235,6 +335,28 @@ export default function ImageProApp() {
       }
     }
     setImages([...updatedImages]);
+    // 重新生成后持久化
+    persistImages([...updatedImages]).catch(console.warn);
+  };
+
+  /** 恢复某张图的上一个历史版本 */
+  const restoreHistory = (id: number) => {
+    const index = images.findIndex(img => img.id === id);
+    if (index === -1) return;
+    const img = images[index];
+    if (!img.history.length) return;
+
+    const [prev, ...rest] = img.history;
+    const updatedImages = [...images];
+    // 把当前版本推回 history 末尾，弹出最近的历史版本
+    updatedImages[index] = {
+      ...img,
+      url: prev,
+      status: 'done',
+      history: rest,
+    };
+    setImages(updatedImages);
+    persistImages(updatedImages).catch(console.warn);
   };
 
   const downloadAll = async () => {
@@ -364,6 +486,40 @@ export default function ImageProApp() {
               exit={{ opacity: 0, y: -20 }}
               className="space-y-8"
             >
+              {/* ── 缓存恢复横幅 ── */}
+              {cachedSession && (
+                <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4 flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 bg-orange-100 rounded-xl flex items-center justify-center text-orange-500 flex-shrink-0">
+                      <History size={18} />
+                    </div>
+                    <div>
+                      <p className="font-semibold text-sm text-orange-900">发现上次未完成的图片生成</p>
+                      <p className="text-xs text-orange-600 mt-0.5">
+                        {new Date(cachedSession.timestamp).toLocaleString('zh-CN')}
+                        {' · '}已生成 {cachedSession.images.filter(i => i.url).length}/7 张
+                        {' · '}恢复后可继续下载或重新生成
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <button
+                      onClick={handleRestoreSession}
+                      className="px-4 py-2 bg-orange-500 text-white rounded-xl text-sm font-bold hover:bg-orange-600 transition-all"
+                    >
+                      恢复结果
+                    </button>
+                    <button
+                      onClick={() => setCachedSession(null)}
+                      className="p-2 text-orange-400 hover:text-orange-600 transition-colors"
+                      title="忽略"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="text-center space-y-2">
                 <h2 className="text-3xl font-bold">开始您的产品视觉之旅</h2>
                 <p className="text-gray-500">提供基本信息，AI 将为您打造专业级的亚马逊前台图片</p>
@@ -684,11 +840,24 @@ export default function ImageProApp() {
                         <span className="text-xs font-bold text-orange-500 uppercase tracking-wider">Image {img.id}</span>
                         <h4 className="font-bold">{img.type}</h4>
                       </div>
-                      {img.status === 'done' && (
-                        <div className="bg-green-100 text-green-600 p-1 rounded-full">
-                          <CheckCircle2 size={16} />
-                        </div>
-                      )}
+                      <div className="flex items-center gap-2">
+                        {/* 历史版本按钮 */}
+                        {img.history.length > 0 && (
+                          <button
+                            onClick={() => restoreHistory(img.id)}
+                            title={`恢复上一版（还有 ${img.history.length} 个历史版本）`}
+                            className="flex items-center gap-1 px-2.5 py-1.5 bg-gray-100 hover:bg-orange-100 text-gray-500 hover:text-orange-600 rounded-lg text-xs font-bold transition-colors"
+                          >
+                            <History size={12} />
+                            上一版
+                          </button>
+                        )}
+                        {img.status === 'done' && (
+                          <div className="bg-green-100 text-green-600 p-1 rounded-full">
+                            <CheckCircle2 size={16} />
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}

@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
   Plus, 
@@ -8,7 +8,9 @@ import {
   Sparkles, 
   Loader2, 
   Copy,
-  Check
+  Check,
+  History,
+  X
 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -20,6 +22,22 @@ import {
   type ProductDetails, 
   type GeneratedCopy 
 } from "../services/gemini";
+import { generateCacheKey, cacheSet, cacheGet, lsSave, lsLoad } from "../services/cache";
+
+// ── 缓存会话类型 ──────────────────────────────────────────
+interface CopyCacheSession {
+  competitorUrls: string[];
+  analysis: CompetitorAnalysis;
+  productDetails: ProductDetails;
+  selectedKeywords: string[];
+  selectedSellingPoints: string[];
+  selectedReviewInsights: string[];
+  selectedImageInsights: string[];
+  result: GeneratedCopy;
+  timestamp: number;
+}
+
+const LAST_COPY_KEY = 'copy_last_key';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -50,6 +68,31 @@ export default function CopywriterApp() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [result, setResult] = useState<GeneratedCopy | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  // ── 缓存恢复 ─────────────────────────────────────────────
+  const [cachedSession, setCachedSession] = useState<CopyCacheSession | null>(null);
+
+  useEffect(() => {
+    const lastKey = lsLoad<string>(LAST_COPY_KEY);
+    if (!lastKey) return;
+    cacheGet<CopyCacheSession>(lastKey).then(session => {
+      if (session?.result) setCachedSession(session);
+    });
+  }, []);
+
+  const handleRestoreSession = () => {
+    if (!cachedSession) return;
+    setCompetitorUrls(cachedSession.competitorUrls);
+    setAnalysis(cachedSession.analysis);
+    setProductDetails(cachedSession.productDetails);
+    setSelectedKeywords(cachedSession.selectedKeywords);
+    setSelectedSellingPoints(cachedSession.selectedSellingPoints);
+    setSelectedReviewInsights(cachedSession.selectedReviewInsights);
+    setSelectedImageInsights(cachedSession.selectedImageInsights);
+    setResult(cachedSession.result);
+    setStep("result");
+    setCachedSession(null);
+  };
 
   const handleAddUrl = () => setCompetitorUrls([...competitorUrls, ""]);
   const handleRemoveUrl = (index: number) => {
@@ -126,6 +169,31 @@ export default function CopywriterApp() {
       );
       setResult(data);
       setStep("result");
+
+      // ── 保存到缓存 ───────────────────────────────────────
+      try {
+        const key = await generateCacheKey({
+          urls: [...competitorUrls].sort().join(','),
+          pd: JSON.stringify(productDetails),
+          kw: [...selectedKeywords].sort().join(','),
+          sp: [...selectedSellingPoints].sort().join(','),
+        });
+        const session: CopyCacheSession = {
+          competitorUrls,
+          analysis: analysis!,
+          productDetails,
+          selectedKeywords,
+          selectedSellingPoints,
+          selectedReviewInsights,
+          selectedImageInsights,
+          result: data,
+          timestamp: Date.now(),
+        };
+        await cacheSet(key, session);
+        lsSave(LAST_COPY_KEY, key);
+      } catch (cacheErr) {
+        console.warn('[Cache] 文案缓存保存失败:', cacheErr);
+      }
     } catch (error) {
       console.error(error);
     } finally {
@@ -180,6 +248,39 @@ ${result.searchTerms}
               exit={{ opacity: 0, y: -20 }}
               className="space-y-8"
             >
+              {/* ── 缓存恢复横幅 ── */}
+              {cachedSession && (
+                <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4 flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 bg-orange-100 rounded-xl flex items-center justify-center text-orange-500 flex-shrink-0">
+                      <History size={18} />
+                    </div>
+                    <div>
+                      <p className="font-semibold text-sm text-orange-900">发现上次的生成记录</p>
+                      <p className="text-xs text-orange-600 mt-0.5">
+                        {new Date(cachedSession.timestamp).toLocaleString('zh-CN')}
+                        {' · '}点击恢复可直接查看上次结果
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <button
+                      onClick={handleRestoreSession}
+                      className="px-4 py-2 bg-orange-500 text-white rounded-xl text-sm font-bold hover:bg-orange-600 transition-all"
+                    >
+                      恢复结果
+                    </button>
+                    <button
+                      onClick={() => setCachedSession(null)}
+                      className="p-2 text-orange-400 hover:text-orange-600 transition-colors"
+                      title="忽略"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="space-y-2">
                 <h2 className="text-3xl font-bold tracking-tight italic font-serif">分析竞品</h2>
                 <p className="text-black/60">输入亚马逊竞品链接，我们将为您提取关键词和核心卖点。</p>
